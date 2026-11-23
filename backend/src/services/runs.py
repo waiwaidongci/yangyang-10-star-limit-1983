@@ -23,7 +23,8 @@ def create_run(db, request, actor):
                        last_observation_id=sample_ids[-1], sample_size=len(sample_ids))
     db.add(item)
     db.flush()
-    db.add(AuditEvent(actor=actor, action='run.created', detail=f'分析 #{item.id}，固化 {item.sample_size} 条观测'))
+    db.add(AuditEvent(actor=actor, action='run.created',
+                      detail=f'分析 #{item.id}，固化 {item.sample_size} 条版本记录'))
     return item
 
 

@@ -7,6 +7,26 @@ import { bindDownloads, bindForm, notify } from '../hooks/actions.js';
 import { esc, formatMetric, timeLabel } from '../utils/html.js';
 import { runTable } from './analysis.js';
 
+function versionLines(exposures) {
+  if (!exposures.length) return '—';
+  const revised = exposures.filter(item => Number(item.revision) > 1);
+  return `${exposures.length} 帧` + (revised.length ? `（含 ${revised.length} 帧更正：${revised.slice(0, 4).map(item => `${item.exposure_code} r${item.revision}`).join('、')}${revised.length > 4 ? ' 等' : ''}）` : '');
+}
+
+function segmentAudit(versions) {
+  if (!versions?.segments?.length) return '';
+  const rows = versions.segments.map(segment => ({
+    label: segment.label,
+    policy: segment.policy,
+    cutoff: segment.cutoff ? timeLabel(segment.cutoff) : '发起分析时刻',
+    coverage: `${segment.nights?.length ?? 0} 夜 · ${versionLines(segment.exposures)}`,
+    missing: segment.missing?.length ? `${segment.missing.length} 帧（${segment.missing.slice(0, 3).map(item => item.exposure_code).join('、')}${segment.missing.length > 3 ? ' 等' : ''}）` : '—',
+  }));
+  return `<section class="panel"><div class="panel-heading"><h2>分段版本核对</h2></div>
+    <p class="panel-body">快照共 ${esc(versions.snapshot_versions)} 条版本记录、${esc(versions.exposures)} 帧曝光。训练段只用该段首夜之前收到的版本；验证、留出与排程使用发起分析时已收到的最新版本。</p>
+    ${table([{key:'label',label:'分段'},{key:'policy',label:'取值口径'},{key:'cutoff',label:'截止'},{key:'coverage',label:'观测夜与曝光版本'},{key:'missing',label:'未入段'}], rows)}</section>`;
+}
+
 export async function resultPage(spec, user, route) {
   if (!route.id) {
     const runs = await get('/runs');
@@ -24,6 +44,7 @@ export async function resultPage(spec, user, route) {
   if (!run.review && user.role === Role.SUPERVISOR) review = `<form id="review-form" data-id="${id}"><label class="field"><span>复核结论</span><select name="decision"><option value="approved">签核通过</option><option value="returned">退回补充</option></select></label><label class="field"><span>复核依据</span><textarea name="note" required minlength="2" maxlength="1000" placeholder="${esc(spec.decision_prompt)}"></textarea></label>${formError}<button class="primary">保存复核</button></form>`;
   const parameters = spec.parameters.map(field => `<li><span>${esc(field.label)}</span><b>${esc(run.parameters[field.key])}</b></li>`).join('');
   return `${head}<div class="split result-summary"><section class="conclusion"><h2>${esc(data.headline)}</h2><p>${esc(data.summary)}</p>${data.metrics.length ? `<dl class="metrics">${data.metrics.map(metric => `<div><dt>${esc(metric.label)}</dt><dd>${esc(formatMetric(metric.value))}${metric.unit ? `<small> ${esc(metric.unit)}</small>` : ''}</dd></div>`).join('')}</dl>` : ''}</section><aside class="method"><h2>本次条件</h2><ul class="parameters">${parameters}</ul>${bars(data.chart)}</aside></div>
+    ${segmentAudit(data.versions)}
     <section class="panel"><div class="panel-heading"><h2>计算明细</h2><button data-download="/runs/${id}/export">下载 CSV</button></div>${table(data.columns,data.rows,'当前参数下无明细，计算结论保留。')}</section>
     <section class="panel"><div class="panel-heading"><h2>业务签核</h2>${run.review?.decision === Decision.APPROVED ? '<a href="#reports">查看分发 →</a>' : ''}</div><div class="panel-body">${review}</div></section>`;
 }

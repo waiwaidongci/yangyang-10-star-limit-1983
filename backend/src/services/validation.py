@@ -1,5 +1,5 @@
 import math
-from datetime import date
+from datetime import date, datetime, timezone
 
 from src.services.errors import BusinessError
 
@@ -29,6 +29,11 @@ def validated(fields, supplied, *, defaults=False):
                     value = int(value)
             elif kind == 'date':
                 value = date.fromisoformat(str(value)).isoformat()
+            elif kind == 'datetime':
+                moment = datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+                if moment.tzinfo is None:
+                    raise ValueError
+                value = moment.astimezone(timezone.utc).isoformat()
             elif kind == 'choice':
                 if value not in field['choices']:
                     raise ValueError

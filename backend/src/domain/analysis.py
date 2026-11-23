@@ -1,6 +1,6 @@
 """Forward selection and scheduling from V-band calibration exposures."""
 
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from math import fsum, isfinite, log10, sqrt
 from random import Random
 from statistics import median
@@ -109,6 +109,67 @@ def _validated_row(row: dict) -> dict:
     result[RESPONSE] = _number(row.get(RESPONSE), "实测 V 波段极限星等（mag）", 5, 30)
     _add_log_feature(result)
     return result
+
+
+def _revision_number(value: object, label: str, *, optional: bool) -> int:
+    if value is None or value == "":
+        if optional:
+            return 1
+        raise ValueError(f"{label}须为正整数。")
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{label}须为正整数。") from None
+    if not isfinite(number) or not number.is_integer() or number < 1:
+        raise ValueError(f"{label}须为正整数。")
+    return int(number)
+
+
+def validated_revision(raw: dict) -> dict:
+    """Validate one received exposure version and stamp revision metadata.
+
+    ``revision`` is supplied by the upstream photometry workflow keyed on the
+    exposure code. When absent the exposure is the original night result,
+    i.e. revision 1.
+
+    Originals are deemed received at the end of their observation night. A
+    correction (revision > 1) may carry an explicit receipt instant; without
+    one the server stamps the moment it is accepted. Retries of the same
+    revision keep the first receipt instant because dedup ignores the clock.
+    """
+    row = _validated_row(raw)
+    revision = _revision_number(raw.get("revision"), "修订号", optional=True)
+    if revision == 1:
+        received_at = night_received_at(row["observed_on"])
+    elif raw.get("received_at"):
+        received_at = _parse_received_at(raw.get("received_at"), row["observed_on"])
+    else:
+        received_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    row["revision"] = revision
+    row["received_at"] = received_at.isoformat() + "Z"
+    return row
+
+
+def night_received_at(observed_on: str) -> datetime:
+    """Original exposures count as received at the end of the observation night.
+
+    The night is keyed by its start date (跨午夜仍归该夜); its end is 24:00
+    Beijing time on that date, expressed here in naive UTC to match storage.
+    """
+    end = datetime.combine(date.fromisoformat(observed_on), time.min) + timedelta(days=1)
+    return end.replace(tzinfo=timezone(timedelta(hours=8))).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def night_start(observed_on: str) -> datetime:
+    """First instant of an observation night, as naive UTC.
+
+    Training segments may only use versions received strictly before this
+    instant, so anything first known once the night opens is forecast-only.
+    """
+    begin = datetime.combine(date.fromisoformat(observed_on), time.min)
+    return begin.replace(tzinfo=timezone(timedelta(hours=8))).astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def validate(row: dict) -> None:
@@ -233,6 +294,138 @@ def _metric(label, value, unit=None):
     return result
 
 
+def _parse_received_at(value, observed_on: str) -> datetime:
+    """Return a naive UTC instant for when a version was received.
+
+    Corrections must carry an explicit, zoned instant. Original exposures (no
+    ``received_at``) are treated as arriving at the end of their night.
+    """
+    if value is None or value == "":
+        return night_received_at(observed_on)
+    if isinstance(value, datetime):
+        moment = value
+    else:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            moment = datetime.fromisoformat(text)
+        except ValueError:
+            raise ValueError("收到更正时间须为有效的 ISO 8601 时间。") from None
+    if moment.tzinfo is None:
+        raise ValueError("收到更正时间须包含时区。")
+    return moment.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _same_measurement(left: dict, right: dict) -> bool:
+    keys = ("observed_on", RESPONSE, *FEATURES)
+    return all(left.get(key) == right.get(key) for key in keys)
+
+
+def _version_rows(records: list[dict]) -> list[dict]:
+    """Validate ledger rows and attach revision and received-at metadata."""
+    versions = []
+    seen = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("校准曝光记录格式不正确。")
+        row = _validated_row(record)
+        row["revision"] = _revision_number(record.get("revision"), "修订号", optional=True)
+        row["received_at"] = _parse_received_at(record.get("received_at"), row["observed_on"])
+        key = (row["exposure_code"], row["revision"])
+        if key in seen:
+            if _same_measurement(seen[key], row):
+                continue
+            raise ValueError(f"校准曝光 {key[0]} 的修订 {key[1]} 出现多条不同内容。")
+        seen[key] = row
+        versions.append(row)
+    return versions
+
+
+def _group_versions(versions: list[dict]):
+    by_code = {}
+    codes_by_night = {}
+    for row in versions:
+        rows = by_code.setdefault(row["exposure_code"], [])
+        if rows and rows[0]["observed_on"] != row["observed_on"]:
+            raise ValueError(f"校准曝光 {row['exposure_code']} 的各修订观测夜不一致，请核对编号后重新提交。")
+        rows.append(row)
+        codes_by_night.setdefault(row["observed_on"], set()).add(row["exposure_code"])
+    for rows in by_code.values():
+        rows.sort(key=lambda row: (row["revision"], row["received_at"]))
+    return by_code, codes_by_night, sorted(codes_by_night)
+
+
+def _latest_rows(by_code, codes_by_night, nights):
+    """Score rows with the newest revision received by analysis initiation."""
+    newest = {code: max(rows, key=lambda row: row["revision"]) for code, rows in by_code.items()}
+    return [(night, [newest[code] for code in sorted(codes_by_night[night])]) for night in nights]
+
+
+def _as_of_rows(by_code, codes_by_night, nights, cutoff):
+    """Training rows as they stood just before a segment's first night.
+
+    A revision counts only when it had already been received by ``cutoff``; a
+    later-arriving correction cannot change an earlier training sample.
+    """
+    merged = {}
+    for code, rows in by_code.items():
+        eligible = [row for row in rows if row["received_at"] <= cutoff]
+        if eligible:
+            merged[code] = max(eligible, key=lambda row: row["revision"])
+    grouped = []
+    missing = []
+    for night in nights:
+        group = []
+        for code in sorted(codes_by_night[night]):
+            row = merged.get(code)
+            if row is None:
+                missing.append({"exposure_code": code, "observed_on": night,
+                                "reason": "该段首夜之前未收到可用版本"})
+            else:
+                group.append(row)
+        grouped.append((night, group))
+    return grouped, missing
+
+
+def _flatten(grouped):
+    return [row for _, group in grouped for row in group]
+
+
+def _iso(moment: datetime | None):
+    return moment.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z") if moment else None
+
+
+def _segment_view(key, label, policy, cutoff, grouped, missing=None):
+    exposures = [
+        {"exposure_code": row["exposure_code"], "observed_on": row["observed_on"], "revision": row["revision"],
+         "received_at": _iso(row["received_at"]), "limiting_mag": row[RESPONSE]}
+        for _, group in grouped for row in group
+    ]
+    view = {
+        "key": key,
+        "label": label,
+        "policy": policy,
+        "cutoff": _iso(cutoff),
+        "nights": [night for night, group in grouped if group],
+        "exposures": exposures,
+    }
+    if missing is not None:
+        view["missing"] = missing
+        view["night_count"] = sum(1 for _, group in grouped if group)
+    return view
+
+
+def _insufficient_reason(segment_label, first_night, available, missing):
+    detail = ""
+    absent = sorted({item["observed_on"] for item in missing})
+    if absent:
+        shown = "、".join(absent[:6]) + ("等" if len(absent) > 6 else "")
+        detail = f"；截止前未收到有效版本的观测夜有 {len(absent)} 个（{shown}）"
+    return (f"{segment_label}在首夜 {first_night} 之前仅收到 {available} 个可训练观测夜，"
+            f"低于要求的 {MIN_TRAIN_NIGHTS} 个{detail}。可等待更正入账或补充更早的校准夜后重新发起分析。")
+
+
 def analyze(rows: list[dict], parameters: dict) -> dict:
     holdout_nights = _night_count(parameters.get("holdout_nights", DEFAULT_HOLDOUT_NIGHTS), "最终留出夜数", 30)
     validation_nights = _night_count(parameters.get("validation_nights", DEFAULT_VALIDATION_NIGHTS),
@@ -244,32 +437,61 @@ def analyze(rows: list[dict], parameters: dict) -> dict:
         for key, (label, _, lower, upper) in FEATURES.items()
     }
     _add_log_feature(plan)
-    by_night = {}
-    seen = set()
-    for record in rows:
-        row = _validated_row(record)
-        code = row["exposure_code"]
-        if code in seen:
-            raise ValueError(f"校准曝光 {code} 重复，请保留每帧一条校准结果。")
-        seen.add(code)
-        by_night.setdefault(row["observed_on"], []).append(row)
 
-    nights = sorted(by_night)
+    versions = _version_rows(rows)
+    if not versions:
+        raise ValueError("没有可用的校准曝光版本。")
+    by_code, codes_by_night, nights = _group_versions(versions)
+
     minimum = MIN_TRAIN_NIGHTS + FOLD_COUNT * validation_nights + holdout_nights
     if len(nights) < minimum:
-        raise ValueError(f"当前参数至少需要 {minimum} 个不同观测夜，现有 {len(nights)} 夜。")
-    for group in by_night.values():
-        group.sort(key=lambda row: row["exposure_code"])
-    ordered = [row for night in nights for row in by_night[night]]
+        raise ValueError(
+            f"当前参数至少需要 {minimum} 个不同观测夜（{MIN_TRAIN_NIGHTS} 个训练夜 + "
+            f"{FOLD_COUNT} × {validation_nights} 个验证夜 + {holdout_nights} 个留出夜），"
+            f"现有 {len(nights)} 夜。可补充更早的校准夜或等待晚到更正入账后重新发起分析。"
+        )
+
     development_nights = nights[:-holdout_nights]
     final_nights = nights[-holdout_nights:]
-    development = [row for night in development_nights for row in by_night[night]]
     first_validation = len(development_nights) - FOLD_COUNT * validation_nights
+
+    folding = []
     folds = []
-    for begin in range(first_validation, len(development_nights), validation_nights):
-        train = [row for night in development_nights[:begin] for row in by_night[night]]
-        validation = [row for night in development_nights[begin:begin + validation_nights] for row in by_night[night]]
-        folds.append((train, validation))
+    for index, begin in enumerate(range(first_validation, len(development_nights), validation_nights), 1):
+        train_nights = development_nights[:begin]
+        validation_nights_block = development_nights[begin:begin + validation_nights]
+        cutoff = night_start(validation_nights_block[0])
+        label = f"第 {index} 折训练"
+        train_grouped, missing = _as_of_rows(by_code, codes_by_night, train_nights, cutoff)
+        available = sum(1 for _, group in train_grouped if group)
+        if available < MIN_TRAIN_NIGHTS:
+            raise ValueError(_insufficient_reason(label, validation_nights_block[0], available, missing))
+        validation_grouped = _latest_rows(by_code, codes_by_night, validation_nights_block)
+        train_rows = _flatten(train_grouped)
+        validation_rows = _flatten(validation_grouped)
+        folds.append((train_rows, validation_rows))
+        folding.append(_segment_view(f"fold_{index}_train", label,
+                                     "只用该段首夜之前收到的版本", cutoff, train_grouped, missing))
+        folding.append(_segment_view(f"fold_{index}_validation", f"第 {index} 折验证",
+                                     "按发起分析时收到的最新版本计分", None, validation_grouped))
+
+    holdout_cutoff = night_start(final_nights[0])
+    development_grouped, development_missing = _as_of_rows(by_code, codes_by_night, development_nights, holdout_cutoff)
+    development_nights_available = sum(1 for _, group in development_grouped if group)
+    if development_nights_available < MIN_TRAIN_NIGHTS:
+        raise ValueError(_insufficient_reason("最终留出训练", final_nights[0],
+                                              development_nights_available, development_missing))
+    holdout_grouped = _latest_rows(by_code, codes_by_night, final_nights)
+    schedule_grouped = _latest_rows(by_code, codes_by_night, nights)
+    development = _flatten(development_grouped)
+    ordered = _flatten(schedule_grouped)
+    folding.append(_segment_view("holdout_train", "最终留出训练",
+                                 "只用该段首夜之前收到的版本", holdout_cutoff, development_grouped,
+                                 development_missing))
+    folding.append(_segment_view("holdout_score", "最终留出评分",
+                                 "按发起分析时收到的最新版本计分", None, holdout_grouped))
+    folding.append(_segment_view("scheduling", "排程拟合",
+                                 "使用发起分析时已收到的最新更正", None, schedule_grouped))
 
     ranking = _rank(folds)
     cv_mae, name, features, penalty = ranking[0]
@@ -293,8 +515,7 @@ def analyze(rows: list[dict], parameters: dict) -> dict:
 
     holdout_errors = []
     baseline_errors = []
-    for night in final_nights:
-        group = by_night[night]
+    for night, group in holdout_grouped:
         errors = _errors(group, features, model)
         holdout_errors.extend(errors)
         baseline_errors.extend(_errors(group, (), baseline))
@@ -309,6 +530,13 @@ def analyze(rows: list[dict], parameters: dict) -> dict:
     result_rows.insert(0, {"section": "计划判定", "item": decision, "actual": target,
                            "estimate": round(estimate, 4) if estimate is not None else None,
                            "note": f"预留 {reserve:g} mag"})
+    for segment in folding:
+        detail = f"{segment['policy']}；使用 {len(segment['exposures'])} 帧"
+        if segment["cutoff"]:
+            detail += f"；截止 {segment['cutoff']}"
+        if segment.get("missing"):
+            detail += f"；排除 {len(segment['missing'])} 帧"
+        result_rows.append({"section": "分段版本核对", "item": segment["label"], "note": detail})
     planning_metrics = []
     if estimate is not None:
         planning_metrics = [_metric("计划预测极限星等", round(estimate, 4), "mag"),
@@ -319,7 +547,8 @@ def analyze(rows: list[dict], parameters: dict) -> dict:
             f"三折按夜前向验证选出{name}，验证 MAE 为 {cv_mae:.4f} mag。"
             f"{final_nights[0]} 至 {final_nights[-1]} 的 {holdout_nights} 个留出夜中，"
             f"入选方案 MAE 为 {holdout_mae:.4f} mag，历史中位数基线为 {baseline_mae:.4f} mag。"
-            f"排程估算以全部 {len(nights)} 夜的同配置校准数据为依据。"
+            f"各段训练仅使用该段首夜之前收到的校准版本，验证与留出按发起分析时收到的最新版本计分，"
+            f"排程使用已收到的最新更正（快照共 {len(versions)} 条版本记录、{len(by_code)} 帧曝光）。"
             "极限星等数值越大，可探测的点源越暗。排程仅适用于同一设备的 V 波段单帧 5σ 口径。"
         ),
         "metrics": [
@@ -328,11 +557,17 @@ def analyze(rows: list[dict], parameters: dict) -> dict:
             _metric("最终留出 MAE", holdout_mae, "mag"),
             _metric("历史中位数基线 MAE", baseline_mae, "mag"),
             _metric("留出校准曝光", len(holdout_errors), "帧"),
+            _metric("快照曝光版本", len(versions), "条"),
             *planning_metrics,
         ],
         "columns": COLUMNS,
         "rows": [{"penalty": None, "mae": None, "actual": None, "estimate": None, "coefficient": None,
                   "note": None, **row} for row in result_rows],
+        "versions": {
+            "snapshot_versions": len(versions),
+            "exposures": len(by_code),
+            "segments": folding,
+        },
         "chart": {"label": "同一留出集的平均绝对误差", "unit": "mag", "points": [
             {"label": "入选方案", "value": holdout_mae},
             {"label": "历史中位数基线", "value": baseline_mae},
